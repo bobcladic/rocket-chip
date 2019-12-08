@@ -7,6 +7,7 @@ import freechips.rocketchip.config._
 import freechips.rocketchip.diplomacy._
 
 case object MultiChipMaskKey extends Field[BigInt](0)
+case object MultiChipIdKey extends Field(BundleBridgeEphemeralNode[UInt]()(ValName("multi_chip_id")))
 
 trait HasRegionReplicatorParams {
   val replicatorMask: BigInt
@@ -15,7 +16,8 @@ trait HasRegionReplicatorParams {
 // Replicate all devices below this adapter that are inside replicationRegion to multiple addreses based on mask.
 // If a device was at 0x4000-0x4fff and mask=0x10000, it will now be at 0x04000-0x04fff and 0x14000-0x14fff.
 class RegionReplicator(mask: BigInt = 0, region: Option[AddressSet] = Some(AddressSet.everything))(implicit p: Parameters) extends LazyModule {
-  def ids = AddressSet.enumerateMask(mask)
+  val ids = AddressSet.enumerateMask(mask)
+  val bits = AddressSet.enumerateBits(mask)
 
   val node = TLAdapterNode(
     clientFn  = { cp => cp },
@@ -27,18 +29,29 @@ class RegionReplicator(mask: BigInt = 0, region: Option[AddressSet] = Some(Addre
     })}
   )
 
+  val chip_id = BundleBridgeSink[UInt]()
+  chip_id := p(MultiChipIdKey)
+
   lazy val module = new LazyModuleImp(this) {
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
       out <> in
 
-      val addr = in.a.bits.address
-      val contained = region.foldLeft(false.B)(_ || _.contains(addr))
-      out.a.bits.address := Mux(contained, ~(~addr | mask.U), addr)
-
-      // We can't support probes; we don't have the required information
-      edgeOut.manager.managers.foreach { m =>
-        require (m.regionType < RegionType.TRACKED, s"${m.name} has regionType ${m.regionType}, which requires Probe support a RegionReplicator cannot provide")
+      // Which address within the mask routes to local devices?
+      val local_address = (bits zip chip_id.bundle.asBools).foldLeft(0.U) {
+        case (acc, (bit, sel)) => acc | Mux(sel, bit.U, 0.U)
       }
+
+      val a_addr = in.a.bits.address
+      val a_contained = region.foldLeft(false.B)(_ || _.contains(a_addr))
+      out.a.bits.address := Mux(a_contained, ~(~a_addr | mask.U), a_addr)
+
+      val b_addr = out.b.bits.address
+      val b_contained = region.foldLeft(false.B)(_ || _.contains(b_addr))
+      in.b.bits.address := Mux(b_contained, b_addr | local_address, b_addr)
+
+      val c_addr = in.c.bits.address
+      val c_contained = region.foldLeft(false.B)(_ || _.contains(c_addr))
+      out.c.bits.address := Mux(c_contained, ~(~c_addr | mask.U), c_addr)
     }
   }
 }
